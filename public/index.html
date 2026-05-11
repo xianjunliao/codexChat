@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChatGPT</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div>
+        <h1>ChatGPT</h1>
+        <p class="intro">支持自然语言聊天和图片生成。输入普通问题会直接对话；输入“生成图片、画一张、来一张”等描述会返回可预览图片。</p>
+        <p id="status">正在检查服务...</p>
+      </div>
+      <button id="clearButton" type="button" title="清空会话">清空</button>
+    </header>
+
+    <section id="messages" class="messages" aria-live="polite"></section>
+
+    <form id="chatForm" class="composer">
+      <textarea id="promptInput" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+      <button id="sendButton" type="submit">发送</button>
+    </form>
+  </main>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
