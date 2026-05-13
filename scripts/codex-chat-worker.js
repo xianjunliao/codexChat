@@ -79,6 +79,10 @@ async function processJob(job) {
   const startedAt = Date.now();
   try {
     const requestPayload = parseJson(job.requestJson);
+    if (await tryProcessJobStream(job, requestPayload, startedAt)) {
+      log(`Completed ${requestId} via stream`);
+      return;
+    }
     const chatResponse = await postJson(`${chatBaseUrl}/v1/chat/completions`, {
       ...requestPayload,
       model: requestPayload.model || "chatgpt"
@@ -107,6 +111,105 @@ async function processJob(job) {
     }).catch(() => {});
     throw error;
   }
+}
+
+async function tryProcessJobStream(job, requestPayload, startedAt) {
+  const requestId = job.requestId;
+  let receivedEvent = false;
+  const controller = new AbortController();
+  const timeout = chatRequestTimeoutMs > 0
+    ? setTimeout(() => controller.abort(new Error(`stream timed out after ${Math.round(chatRequestTimeoutMs / 1000)} seconds`)), chatRequestTimeoutMs)
+    : null;
+  try {
+    const response = await fetch(`${chatBaseUrl}/api/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...requestPayload,
+        model: requestPayload.model || "chatgpt"
+      }),
+      signal: controller.signal
+    });
+    if (!response.ok || !response.body) return false;
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalEvent = null;
+    for await (const chunk of response.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        receivedEvent = true;
+        if (event.type === "final") {
+          finalEvent = event;
+        } else if (event.type === "error") {
+          await postCodexEvent(requestId, event).catch((error) => log(`Event delivery failed ${requestId}: ${errorMessage(error)}`));
+          throw new Error(event.content || event.title || "Codex stream failed");
+        } else {
+          await postCodexEvent(requestId, event).catch((error) => log(`Event delivery failed ${requestId}: ${errorMessage(error)}`));
+        }
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const event = JSON.parse(buffer);
+      receivedEvent = true;
+      if (event.type === "final") {
+        finalEvent = event;
+      } else if (event.type === "error") {
+        await postCodexEvent(requestId, event).catch((error) => log(`Event delivery failed ${requestId}: ${errorMessage(error)}`));
+        throw new Error(event.content || event.title || "Codex stream failed");
+      } else {
+        await postCodexEvent(requestId, event).catch((error) => log(`Event delivery failed ${requestId}: ${errorMessage(error)}`));
+      }
+    }
+    if (!finalEvent) {
+      if (!receivedEvent) return false;
+      throw new Error("Codex stream ended without a final event");
+    }
+    let assets = Array.isArray(finalEvent.assets) ? finalEvent.assets : [];
+    const assistantText = finalEvent.content || "";
+    const chatResponse = {
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: assistantText,
+          assets
+        },
+        finish_reason: "stop"
+      }],
+      assets
+    };
+    if (uploadToLife && assets.length) {
+      assets = await uploadAssetsToLife(assets);
+      chatResponse.assets = assets;
+      chatResponse.choices[0].message.assets = assets;
+    }
+    await deliverCompletion(requestId, "complete", {
+      assistantText,
+      responseJson: chatResponse,
+      assets,
+      statusCode: 200,
+      latencyMs: Date.now() - startedAt
+    });
+    return true;
+  } catch (error) {
+    if (receivedEvent) throw error;
+    log(`Stream path unavailable for ${requestId}, falling back to completion API: ${errorMessage(error)}`);
+    return false;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function postCodexEvent(requestId, event) {
+  if (!requestId || !event) return null;
+  return await postJson(`${lifeBaseUrl}/api/codex-chat/worker/jobs/${encodeURIComponent(requestId)}/events`, {
+    event
+  });
 }
 
 async function deliverCompletion(requestId, kind, payload) {

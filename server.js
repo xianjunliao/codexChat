@@ -13,7 +13,7 @@ const outputRoot = path.join(__dirname, "generated", "codex-chat");
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 3037);
 const publicBaseUrl = `http://${host}:${port}`;
-const serviceVersion = "20260512-lv2-limited-workspace-v6";
+const serviceVersion = "20260513-codex-events-v1";
 const serviceModel = process.env.CODEX_CHAT_MODEL || "chatgpt";
 const codexCommand = process.env.CODEX_COMMAND || resolveCodexCommand();
 const codexTimeoutMs = parseTimeoutMs(process.env.CODEX_CHAT_TIMEOUT_MS, 60 * 60 * 1000);
@@ -98,6 +98,10 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
+    if (req.method === "POST" && url.pathname === "/api/chat/stream") {
+      await streamCodexChat(req, res);
+      return;
+    }
     if (req.method === "GET" && url.pathname.startsWith("/outputs/")) {
       await serveOutput(req, res, url);
       return;
@@ -116,7 +120,45 @@ server.listen(port, host, () => {
   console.log(`ChatGPT service running at http://${host}:${port}`);
 });
 
-async function runCodexChat(payload) {
+async function streamCodexChat(req, res) {
+  res.writeHead(200, {
+    "Content-Type": "application/x-ndjson; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Private-Network": "true"
+  });
+  const emit = (event) => {
+    res.write(JSON.stringify({
+      ts: Date.now(),
+      ...event
+    }) + "\n");
+  };
+  try {
+    const payload = await readJson(req);
+    const result = await runCodexChat(payload, emit);
+    emit({
+      type: "final",
+      status: "done",
+      title: "处理完成",
+      content: result.answer,
+      assets: result.assets
+    });
+  } catch (error) {
+    emit({
+      type: "error",
+      status: "error",
+      title: "调用失败",
+      content: errorMessage(error)
+    });
+  } finally {
+    res.end();
+  }
+}
+
+async function runCodexChat(payload, onEvent = () => {}) {
   const requestId = "chat-" + Date.now() + "-" + crypto.randomBytes(4).toString("hex");
   const wantsImage = isImageRequest(payload);
   const workspaceAllowed = canOperateWorkspace(payload);
@@ -129,11 +171,31 @@ async function runCodexChat(payload) {
   if (wantsImage) {
     await fs.mkdir(outputDir, { recursive: true });
   }
+  onEvent({
+    type: "codex_step",
+    status: "running",
+    title: wantsImage ? "准备生成图片" : (workspaceAllowed ? "准备 Codex 编程任务" : "准备对话任务"),
+    content: workspaceAllowed
+      ? `工作区：${workspaceRoot}\n沙箱：${sandboxMode}`
+      : "当前请求未启用工作区写入权限"
+  });
   const promptFile = path.join(dataDir, `${requestId}-prompt.txt`);
   const lastMessageFile = path.join(dataDir, `${requestId}-last-message.txt`);
   await fs.writeFile(promptFile, buildPrompt(payload, { wantsImage, outputDir, requestId, imageNamePrefix, workspaceRoot, sandboxMode, imageAttachments, workspaceAllowed }), "utf8");
   const hasLocalImageAttachments = imageAttachments.some((attachment) => !attachment.remote);
-  const result = await runCodex(promptFile, lastMessageFile, { wantsImage, workspaceRoot, sandboxMode, attachmentDir: hasLocalImageAttachments ? attachmentDir : "" });
+  onEvent({
+    type: "codex_step",
+    status: "running",
+    title: "启动 Codex",
+    content: "正在执行本地 Codex 任务，输出会实时同步到对话界面"
+  });
+  const result = await runCodex(promptFile, lastMessageFile, {
+    wantsImage,
+    workspaceRoot,
+    sandboxMode,
+    attachmentDir: hasLocalImageAttachments ? attachmentDir : "",
+    onEvent
+  });
   const lastMessage = existsSync(lastMessageFile)
     ? (await fs.readFile(lastMessageFile, "utf8")).trim()
     : "";
@@ -144,6 +206,18 @@ async function runCodexChat(payload) {
   const answer = assets.length
     ? (assets.length > 1 ? `Generated ${assets.length} images.` : "Generated image.")
     : (lastMessage || result.stdout.trim() || "Codex completed without a final message.");
+  if (workspaceAllowed) {
+    const changedFiles = collectChangedFiles(workspaceRoot);
+    if (changedFiles.length) {
+      onEvent({
+        type: "file_change",
+        status: "done",
+        title: "检测到文件变更",
+        content: changedFiles.join("\n"),
+        files: changedFiles
+      });
+    }
+  }
   return { answer, assets };
 }
 
@@ -285,6 +359,7 @@ function formatImageAttachmentPrompt(attachments) {
 async function runCodex(promptFile, lastMessageFile, options = {}) {
   return new Promise((resolve) => {
     const workspaceRoot = resolveLocalPath(options.workspaceRoot || __dirname);
+    const onEvent = typeof options.onEvent === "function" ? options.onEvent : () => {};
     const args = [
       "exec",
       "--skip-git-repo-check",
@@ -304,6 +379,14 @@ async function runCodex(promptFile, lastMessageFile, options = {}) {
     let settled = false;
     try {
       const command = buildCommandSpawn(codexCommand, args);
+      onEvent({
+        type: "tool_call",
+        status: "running",
+        title: "执行命令",
+        tool: "codex",
+        command: [command.file, ...command.args].join(" "),
+        content: [command.file, ...command.args].join(" ")
+      });
       child = spawn(command.file, command.args, {
         cwd: workspaceRoot,
         windowsHide: true,
@@ -324,10 +407,24 @@ async function runCodex(promptFile, lastMessageFile, options = {}) {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
+      onEvent({
+        type: "tool_result",
+        status: code === 0 ? "done" : "error",
+        title: code === 0 ? "Codex 执行完成" : "Codex 执行失败",
+        content: extraStderr || `退出码：${code ?? 0}`
+      });
       resolve({ code, stdout, stderr: stderr + extraStderr });
     };
-    child.stdout.on("data", chunk => { stdout += chunk.toString(); });
-    child.stderr.on("data", chunk => { stderr += chunk.toString(); });
+    child.stdout.on("data", chunk => {
+      const text = chunk.toString();
+      stdout += text;
+      emitCodexOutput(onEvent, "stdout", text);
+    });
+    child.stderr.on("data", chunk => {
+      const text = chunk.toString();
+      stderr += text;
+      emitCodexOutput(onEvent, "stderr", text);
+    });
     child.on("error", error => finish(1, errorMessage(error)));
     child.on("close", code => finish(code));
     fs.readFile(promptFile, "utf8")
@@ -514,6 +611,39 @@ function terminateProcessTree(child) {
   }
 }
 
+function emitCodexOutput(onEvent, source, text) {
+  const clean = String(text || "").replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").trim();
+  if (!clean) return;
+  const chunks = clean.split(/\r?\n/).filter(Boolean).slice(-8);
+  for (const line of chunks) {
+    onEvent({
+      type: "codex_output",
+      status: "running",
+      title: source === "stderr" ? "Codex log" : "Codex output",
+      source,
+      content: trimText(line, 2000)
+    });
+  }
+}
+
+function collectChangedFiles(workspaceRoot) {
+  try {
+    const result = spawnSync("git", ["status", "--short"], {
+      cwd: workspaceRoot,
+      windowsHide: true,
+      encoding: "utf8"
+    });
+    if (result.status !== 0) return [];
+    return String(result.stdout || "")
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+      .slice(0, 80);
+  } catch {
+    return [];
+  }
+}
+
 function resolveCodexCommand() {
   const candidates = [
     process.env.NVM_SYMLINK ? path.join(process.env.NVM_SYMLINK, "codex.cmd") : "",
@@ -656,11 +786,12 @@ function isWenyuan(payload) {
     payload?.ownerName,
     payload?.name,
     payload?.auth?.name,
-    payload?.accessAuth?.name
+    payload?.accessAuth?.name,
+    payload?.workspaceAccess
   ];
   return values.some((value) => {
     const text = String(value || "").trim();
-    return text === "文远" || text === "鏂囪繙";
+    return text === "文远" || text === "鏂囪繙" || text === "life-ai-local";
   });
 }
 
