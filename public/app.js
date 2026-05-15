@@ -160,6 +160,7 @@ function buildPayload(coding) {
       .map((message) => ({ role: message.role, content: message.content }))
   };
   if (coding) {
+    payload.streamProgress = true;
     payload.codexElevated = true;
     payload.accessLevel = "lv1";
     payload.signMan = "文远";

@@ -134,7 +134,7 @@ function Start-NodeProcess {
 $ServerPid = Join-Path $LogDir "codex-chat-server.pid"
 $WorkerPid = Join-Path $LogDir "codex-chat-worker-launcher.pid"
 
-$ExpectedServiceVersion = "20260512-lv2-limited-workspace-v6"
+$ExpectedServiceVersion = "20260513-image-assets-v2"
 $ExpectedCodexTimeoutMs = [int64]$env:CODEX_CHAT_TIMEOUT_MS
 $Health = Get-ChatServiceHealth
 if ($null -ne $Health -and $Health.version -eq $ExpectedServiceVersion -and $Health.codexWorkspaceRoot -eq $env:CODEX_CHAT_WORKSPACE_ROOT -and [int64]$Health.codexTimeoutMs -eq $ExpectedCodexTimeoutMs -and $Health.codexSandboxMode -eq $env:CODEX_CHAT_SANDBOX_MODE -and $Health.codexElevatedSandboxMode -eq $env:CODEX_CHAT_ELEVATED_SANDBOX_MODE) {

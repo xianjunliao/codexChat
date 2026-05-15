@@ -134,6 +134,15 @@ codex exec --skip-git-repo-check -C <workspace> -s <sandbox> --output-last-messa
 | `CODEX_CHAT_REQUEST_TIMEOUT_MS` | `3900000` | worker 等待本地聊天服务的超时 |
 | `CODEX_CHAT_LIFE_REQUEST_TIMEOUT_MS` | `60000` | worker 请求 `life` 的短请求超时 |
 | `CODEX_CHAT_REQUEST_RETRIES` | `2` | worker 请求失败后的重试次数 |
+| `CODEX_CHAT_CLEANUP_ON_COMPLETE` | `true` | 请求完成后立即删除 prompt/last-message/附件等临时文件 |
+| `CODEX_CHAT_RETENTION_MAX_AGE_MS` | `3600000` | 兜底清理时的运行产物保留时长，默认 1 小时 |
+| `CODEX_CHAT_RETENTION_MAX_OUTPUT_DIRS` | `5` | 兜底最多保留的本服务图片输出目录数 |
+| `CODEX_CHAT_RETENTION_MAX_DATA_FILES` | `20` | 兜底最多保留的 prompt/last-message 文本文件数 |
+| `CODEX_CHAT_CLEANUP_INTERVAL_MS` | `3600000` | 自动清理间隔，默认 1 小时 |
+| `CODEX_CHAT_CLEANUP_CODEX_GENERATED_IMAGES` | `true` | 是否同时清理 `$CODEX_HOME/generated_images` 的旧图片 |
+| `CODEX_CHAT_CODEX_GENERATED_IMAGES_MAX_AGE_MS` | `3600000` | Codex 默认图片目录兜底保留时长，默认 1 小时 |
+| `CODEX_CHAT_DELETE_RECOVERED_CODEX_IMAGES` | `true` | 从 Codex 默认图片目录恢复并上传后，删除对应源图片 |
+| `CODEX_CHAT_OUTPUT_POST_COMPLETE_TTL_MS` | `120000` | 生图输出目录完成后兜底保留时长，worker 上传成功会更早删除 |
 | `LIFE_BASE_URL` | `http://127.0.0.1:8080` | worker 访问的 `life` 地址 |
 | `CODEX_CHAT_PUBLIC_LIFE_BASE_URL` | 同 `LIFE_BASE_URL` | 图片上传后对外展示的 `life` 地址 |
 | `CHATGPT_BASE_URL` | `http://127.0.0.1:3037` | worker 访问本服务的地址 |

@@ -1,6 +1,6 @@
 import http from "node:http";
 import fs from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
@@ -13,7 +13,7 @@ const outputRoot = path.join(__dirname, "generated", "codex-chat");
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 3037);
 const publicBaseUrl = `http://${host}:${port}`;
-const serviceVersion = "20260513-codex-events-v1";
+const serviceVersion = "20260513-image-assets-v2";
 const serviceModel = process.env.CODEX_CHAT_MODEL || "chatgpt";
 const codexCommand = process.env.CODEX_COMMAND || resolveCodexCommand();
 const codexTimeoutMs = parseTimeoutMs(process.env.CODEX_CHAT_TIMEOUT_MS, 60 * 60 * 1000);
@@ -22,10 +22,20 @@ const codexElevatedSandboxMode = normalizeSandboxMode(process.env.CODEX_CHAT_ELE
 const codexWorkspaceRoot = resolveLocalPath(process.env.CODEX_CHAT_WORKSPACE_ROOT || __dirname);
 const workspaceFilterRoot = resolveLocalPath(process.env.CODEX_CHAT_WORKSPACE_FILTER_ROOT || "E:\\works\\project");
 const codexConfigPath = process.env.CODEX_CONFIG_PATH || path.join(process.env.USERPROFILE || process.env.HOME || "", ".codex", "config.toml");
+const retentionMaxAgeMs = parseTimeoutMs(process.env.CODEX_CHAT_RETENTION_MAX_AGE_MS, 60 * 60 * 1000);
+const retentionMaxOutputDirs = Math.max(1, Number(process.env.CODEX_CHAT_RETENTION_MAX_OUTPUT_DIRS || 5));
+const retentionMaxDataFiles = Math.max(1, Number(process.env.CODEX_CHAT_RETENTION_MAX_DATA_FILES || 20));
+const cleanupIntervalMs = parseTimeoutMs(process.env.CODEX_CHAT_CLEANUP_INTERVAL_MS, 60 * 60 * 1000);
+const cleanupCodexGeneratedImages = String(process.env.CODEX_CHAT_CLEANUP_CODEX_GENERATED_IMAGES || "true").toLowerCase() === "true";
+const codexGeneratedImagesMaxAgeMs = parseTimeoutMs(process.env.CODEX_CHAT_CODEX_GENERATED_IMAGES_MAX_AGE_MS, 60 * 60 * 1000);
+const cleanupArtifactsOnComplete = String(process.env.CODEX_CHAT_CLEANUP_ON_COMPLETE || "true").toLowerCase() !== "false";
+const deleteRecoveredCodexImages = String(process.env.CODEX_CHAT_DELETE_RECOVERED_CODEX_IMAGES || "true").toLowerCase() !== "false";
+const outputPostCompleteTtlMs = parseTimeoutMs(process.env.CODEX_CHAT_OUTPUT_POST_COMPLETE_TTL_MS, 2 * 60 * 1000);
 
 await fs.mkdir(dataDir, { recursive: true });
 await fs.mkdir(publicDir, { recursive: true });
 await fs.mkdir(outputRoot, { recursive: true });
+scheduleRuntimeCleanup();
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -106,6 +116,11 @@ const server = http.createServer(async (req, res) => {
       await serveOutput(req, res, url);
       return;
     }
+    if (req.method === "DELETE" && url.pathname.startsWith("/outputs/")) {
+      const requestId = decodeURIComponent(url.pathname.replace(/^\/outputs\//, "").split("/")[0] || "");
+      sendJson(res, 200, { ok: true, deleted: await deleteOutputRequest(requestId) });
+      return;
+    }
     if (req.method === "GET" && (url.pathname === "/" || url.pathname.startsWith("/assets/"))) {
       await serveStatic(req, res, url);
       return;
@@ -138,7 +153,8 @@ async function streamCodexChat(req, res) {
   };
   try {
     const payload = await readJson(req);
-    const result = await runCodexChat(payload, emit);
+    const onProgressEvent = shouldStreamProgress(payload) ? emit : () => {};
+    const result = await runCodexChat(payload, onProgressEvent);
     emit({
       type: "final",
       status: "done",
@@ -158,12 +174,20 @@ async function streamCodexChat(req, res) {
   }
 }
 
+function shouldStreamProgress(payload) {
+  if (payload?.streamProgress === true || payload?.streamProgress === "true") {
+    return true;
+  }
+  return canOperateWorkspace(payload) && hasRequestedWorkspace(payload);
+}
+
 async function runCodexChat(payload, onEvent = () => {}) {
+  const requestStartedAt = Date.now();
   const requestId = "chat-" + Date.now() + "-" + crypto.randomBytes(4).toString("hex");
   const wantsImage = isImageRequest(payload);
-  const workspaceAllowed = canOperateWorkspace(payload);
+  const workspaceAllowed = canOperateWorkspace(payload) && hasRequestedWorkspace(payload);
   const workspaceRoot = resolveWorkspaceRoot(payload, { workspaceAllowed });
-  const sandboxMode = resolveSandboxMode(payload, { workspaceAllowed });
+  const sandboxMode = resolveSandboxMode(payload, { workspaceAllowed, wantsImage });
   const imageNamePrefix = wantsImage ? `image-${Date.now()}-${crypto.randomBytes(4).toString("hex")}` : "";
   const outputDir = path.join(outputRoot, requestId);
   const attachmentDir = path.join(dataDir, `${requestId}-attachments`);
@@ -172,22 +196,20 @@ async function runCodexChat(payload, onEvent = () => {}) {
     await fs.mkdir(outputDir, { recursive: true });
   }
   onEvent({
-    type: "codex_step",
+    type: "progress",
     status: "running",
-    title: wantsImage ? "准备生成图片" : (workspaceAllowed ? "准备 Codex 编程任务" : "准备对话任务"),
-    content: workspaceAllowed
-      ? `工作区：${workspaceRoot}\n沙箱：${sandboxMode}`
-      : "当前请求未启用工作区写入权限"
+    title: wantsImage ? "准备图片生成" : (workspaceAllowed ? "准备任务" : "准备回复"),
+    content: wantsImage ? "正在准备图片生成..." : (workspaceAllowed ? "正在准备任务上下文..." : "正在理解你的问题...")
   });
   const promptFile = path.join(dataDir, `${requestId}-prompt.txt`);
   const lastMessageFile = path.join(dataDir, `${requestId}-last-message.txt`);
   await fs.writeFile(promptFile, buildPrompt(payload, { wantsImage, outputDir, requestId, imageNamePrefix, workspaceRoot, sandboxMode, imageAttachments, workspaceAllowed }), "utf8");
   const hasLocalImageAttachments = imageAttachments.some((attachment) => !attachment.remote);
   onEvent({
-    type: "codex_step",
+    type: "progress",
     status: "running",
-    title: "启动 Codex",
-    content: "正在执行本地 Codex 任务，输出会实时同步到对话界面"
+    title: wantsImage ? "生成图片" : (workspaceAllowed ? "开始执行" : "组织回答"),
+    content: wantsImage ? "正在生成图片..." : (workspaceAllowed ? "正在执行任务..." : "正在组织回答...")
   });
   const result = await runCodex(promptFile, lastMessageFile, {
     wantsImage,
@@ -199,25 +221,49 @@ async function runCodexChat(payload, onEvent = () => {}) {
   const lastMessage = existsSync(lastMessageFile)
     ? (await fs.readFile(lastMessageFile, "utf8")).trim()
     : "";
-  const assets = wantsImage ? await collectAssets(outputDir, requestId) : [];
+  let assets = wantsImage ? await collectAssets(outputDir, requestId) : [];
+  if (wantsImage && !assets.length) {
+    assets = await collectAssetsFromOutputText(
+      [lastMessage, result.stdout, result.stderr].filter(Boolean).join("\n"),
+      { outputDir, requestId, workspaceRoot }
+    );
+  }
+  if (wantsImage && !assets.length) {
+    assets = await collectAssetsFromCodexGeneratedImages({
+      outputDir,
+      requestId,
+      imageNamePrefix,
+      sinceMs: requestStartedAt - 5000
+    });
+  }
   if (result.code !== 0) {
     throw new Error(trimText(result.stderr || result.stdout || "codex exec failed", 4000));
+  }
+  if (wantsImage && !assets.length) {
+    throw new Error("Image generation did not produce a saved image file. Please retry; no image was uploaded to life.");
   }
   const answer = assets.length
     ? (assets.length > 1 ? `Generated ${assets.length} images.` : "Generated image.")
     : (lastMessage || result.stdout.trim() || "Codex completed without a final message.");
+  if (assets.length) {
+    scheduleOutputRequestCleanup(requestId);
+  }
   if (workspaceAllowed) {
     const changedFiles = collectChangedFiles(workspaceRoot);
     if (changedFiles.length) {
       onEvent({
         type: "file_change",
         status: "done",
-        title: "检测到文件变更",
-        content: changedFiles.join("\n"),
+        title: `${changedFiles.length} 个文件已更改`,
+        content: formatChangedFiles(changedFiles),
         files: changedFiles
       });
     }
   }
+  if (cleanupArtifactsOnComplete) {
+    cleanupRequestDataArtifacts({ promptFile, lastMessageFile, attachmentDir }).catch(() => {});
+  }
+  cleanupRuntimeArtifacts().catch(() => {});
   return { answer, assets };
 }
 
@@ -245,6 +291,29 @@ async function serveOutput(req, res, url) {
   res.end(file);
 }
 
+async function cleanupRequestDataArtifacts({ promptFile, lastMessageFile, attachmentDir } = {}) {
+  for (const filePath of [promptFile, lastMessageFile]) {
+    if (filePath) await fs.rm(filePath, { force: true }).catch(() => {});
+  }
+  if (attachmentDir) {
+    await fs.rm(attachmentDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function deleteOutputRequest(requestId) {
+  const safeId = String(requestId || "").trim();
+  if (!/^chat-\d+-[a-f0-9]+$/i.test(safeId)) return false;
+  const dir = path.join(outputRoot, safeId);
+  if (!path.resolve(dir).startsWith(path.resolve(outputRoot))) return false;
+  await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  return true;
+}
+
+function scheduleOutputRequestCleanup(requestId) {
+  if (!outputPostCompleteTtlMs || outputPostCompleteTtlMs < 0) return;
+  setTimeout(() => deleteOutputRequest(requestId).catch(() => {}), outputPostCompleteTtlMs).unref?.();
+}
+
 function buildPrompt(payload, options = {}) {
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const normalized = messages
@@ -260,11 +329,12 @@ function buildPrompt(payload, options = {}) {
     "Reply directly to the user. Preserve the user's language unless they ask otherwise.",
     "If the request is ordinary conversation or Q&A, answer in plain text or Markdown.",
     options.wantsImage
-      ? "The user is asking for an image. Generate the image now, save final image files into the exact output directory below, and return a brief summary. Do not merely say that you will use an image generation skill."
+      ? "The user is asking for an image. You MUST use the available image generation capability/tool now, save the final image file into the exact output directory below, and return only a brief summary after the file exists. Do not provide a text-only description. Do not claim success unless an actual image file was written."
       : "Do not edit files, run commands, or change the workspace unless the user explicitly asks for coding work.",
     options.workspaceAllowed
       ? "Workspace access is enabled for this request."
       : "Limited access mode: you may only chat, generate images, and inspect attached images. Do not inspect, list, edit, run commands for, or operate any local project/workspace. If the user asks for workspace, file, shell, codebase, or local project operations, politely say: 当前权限仅支持聊天、生图和识别上传图片，暂不支持工作区操作。",
+    "When reading Chinese documentation or source files, preserve UTF-8. If text appears garbled/mojibake, re-read it with an explicit encoding (UTF-8 first, then GBK/GB18030 if needed) before summarizing. Never return garbled text to the user.",
     options.imageAttachments?.length
       ? "The user attached screenshots/images. Inspect the local image files listed below directly with Codex's vision capability before deciding what code changes or explanation are needed. Do not rely only on OCR."
       : "",
@@ -272,7 +342,7 @@ function buildPrompt(payload, options = {}) {
     options.imageAttachments?.length ? formatImageAttachmentPrompt(options.imageAttachments) : "",
     `Codex sandbox mode: ${options.sandboxMode || codexSandboxMode}`,
     options.wantsImage ? `Output directory: ${options.outputDir}` : "",
-    options.wantsImage ? `Save images with unique filenames starting with ${options.imageNamePrefix}, for example ${options.imageNamePrefix}-01.png. Do not use generic names like image-0001.png. Do not claim success if no image file was written.` : "",
+    options.wantsImage ? `Save images with unique filenames starting with ${options.imageNamePrefix}, for example ${options.imageNamePrefix}-01.png. Do not use generic names like image-0001.png. If image generation is unavailable or no file can be written, fail clearly instead of returning a successful text description.` : "",
     options.wantsImage ? "" : "",
     normalized.length ? normalized.join("\n\n") : `USER:\n${fallback}`,
     "",
@@ -280,7 +350,6 @@ function buildPrompt(payload, options = {}) {
   ];
   return base.filter((line, index) => line || index > 3).join("\n");
 }
-
 function normalizeContent(content) {
   if (typeof content === "string") return content.trim();
   if (Array.isArray(content)) {
@@ -379,19 +448,18 @@ async function runCodex(promptFile, lastMessageFile, options = {}) {
     let settled = false;
     try {
       const command = buildCommandSpawn(codexCommand, args);
-      onEvent({
-        type: "tool_call",
-        status: "running",
-        title: "执行命令",
-        tool: "codex",
-        command: [command.file, ...command.args].join(" "),
-        content: [command.file, ...command.args].join(" ")
-      });
       child = spawn(command.file, command.args, {
         cwd: workspaceRoot,
         windowsHide: true,
         shell: false,
-        stdio: ["pipe", "pipe", "pipe"]
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          LANG: process.env.LANG || "C.UTF-8",
+          LC_ALL: process.env.LC_ALL || "C.UTF-8",
+          PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8",
+          POWERSHELL_TELEMETRY_OPTOUT: process.env.POWERSHELL_TELEMETRY_OPTOUT || "1"
+        }
       });
     } catch (error) {
       resolve({ code: 1, stdout, stderr: errorMessage(error) });
@@ -407,12 +475,14 @@ async function runCodex(promptFile, lastMessageFile, options = {}) {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
-      onEvent({
-        type: "tool_result",
-        status: code === 0 ? "done" : "error",
-        title: code === 0 ? "Codex 执行完成" : "Codex 执行失败",
-        content: extraStderr || `退出码：${code ?? 0}`
-      });
+      if (code !== 0 || extraStderr) {
+        onEvent({
+          type: "error",
+          status: "error",
+          title: "执行失败",
+          content: extraStderr || `退出码：${code ?? 0}`
+        });
+      }
       resolve({ code, stdout, stderr: stderr + extraStderr });
     };
     child.stdout.on("data", chunk => {
@@ -470,16 +540,214 @@ async function collectAssets(dir, requestId) {
     const filePath = path.join(dir, file.name);
     const stat = await fs.stat(filePath).catch(() => null);
     const dimensions = await readImageDimensions(filePath);
+    const dataUrl = await imageDataUrl(filePath, contentType(file.name));
     assets.push({
       fileName: file.name,
       type: contentType(file.name),
       size: stat?.size || 0,
       width: dimensions.width,
       height: dimensions.height,
+      dataUrl,
       url: `/outputs/${encodeURIComponent(requestId)}/${encodeURIComponent(file.name)}`
     });
   }
   return assets.sort((a, b) => a.fileName.localeCompare(b.fileName));
+}
+
+async function imageDataUrl(filePath, type) {
+  try {
+    const buffer = await fs.readFile(filePath);
+    return `data:${type || "image/png"};base64,${buffer.toString("base64")}`;
+  } catch {
+    return "";
+  }
+}
+
+async function collectAssetsFromOutputText(text, options = {}) {
+  const imagePaths = extractImagePaths(text);
+  if (!imagePaths.length) return [];
+  const copied = [];
+  await fs.mkdir(options.outputDir, { recursive: true });
+  for (const imagePath of imagePaths) {
+    const sourcePath = resolveReferencedImagePath(imagePath, options.workspaceRoot);
+    if (!sourcePath || copied.includes(sourcePath) || !existsSync(sourcePath)) continue;
+    const fileName = uniqueAssetFileName(options.outputDir, path.basename(sourcePath));
+    const targetPath = path.join(options.outputDir, fileName);
+    if (path.resolve(sourcePath) !== path.resolve(targetPath)) {
+      await fs.copyFile(sourcePath, targetPath).catch(() => null);
+    }
+    copied.push(sourcePath);
+  }
+  return collectAssets(options.outputDir, options.requestId);
+}
+
+async function collectAssetsFromCodexGeneratedImages(options = {}) {
+  const roots = codexGeneratedImageRoots();
+  const candidates = [];
+  for (const root of roots) {
+    candidates.push(...await listRecentImageFiles(root, options.sinceMs || 0));
+  }
+  const unique = new Map();
+  for (const filePath of candidates) {
+    unique.set(path.resolve(filePath).toLowerCase(), filePath);
+  }
+  const recent = Array.from(unique.values()).sort((a, b) => {
+    const left = statMtimeMs(a);
+    const right = statMtimeMs(b);
+    return right - left;
+  }).slice(0, 4);
+  if (!recent.length) return [];
+  await fs.mkdir(options.outputDir, { recursive: true });
+  let index = 1;
+  for (const sourcePath of recent.reverse()) {
+    const ext = path.extname(sourcePath) || ".png";
+    const fileName = `${options.imageNamePrefix || "image"}-${String(index).padStart(2, "0")}${ext}`;
+    const targetPath = path.join(options.outputDir, fileName);
+    await fs.copyFile(sourcePath, targetPath).catch(() => null);
+    if (deleteRecoveredCodexImages) {
+      await fs.rm(sourcePath, { force: true }).catch(() => {});
+    }
+    index += 1;
+  }
+  return collectAssets(options.outputDir, options.requestId);
+}
+
+function codexGeneratedImageRoots() {
+  const roots = [];
+  const home = process.env.CODEX_HOME || path.join(process.env.USERPROFILE || process.env.HOME || "", ".codex");
+  if (home) roots.push(path.join(home, "generated_images"));
+  return roots.filter(Boolean);
+}
+
+async function listRecentImageFiles(root, sinceMs) {
+  if (!root || !existsSync(root)) return [];
+  const results = [];
+  const stack = [root];
+  while (stack.length) {
+    const current = stack.pop();
+    let entries = [];
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const itemPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (statMtimeMs(itemPath) >= sinceMs - 60 * 1000) stack.push(itemPath);
+        continue;
+      }
+      if (!entry.isFile() || !/\.(png|jpe?g|webp|gif)$/i.test(entry.name)) continue;
+      if (statMtimeMs(itemPath) >= sinceMs) results.push(itemPath);
+    }
+  }
+  return results;
+}
+
+function statMtimeMs(filePath) {
+  try {
+    return existsSync(filePath) ? Number(statSync(filePath).mtimeMs || 0) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function scheduleRuntimeCleanup() {
+  cleanupRuntimeArtifacts().catch(() => {});
+  if (cleanupIntervalMs > 0) {
+    setInterval(() => cleanupRuntimeArtifacts().catch(() => {}), cleanupIntervalMs).unref?.();
+  }
+}
+
+async function cleanupRuntimeArtifacts() {
+  const cutoff = Date.now() - retentionMaxAgeMs;
+  await cleanupOldDataFiles(cutoff);
+  await cleanupOldOutputDirs(cutoff);
+  if (cleanupCodexGeneratedImages) {
+    await cleanupOldCodexGeneratedImages(Date.now() - codexGeneratedImagesMaxAgeMs);
+  }
+}
+
+async function cleanupOldDataFiles(cutoff) {
+  const files = await listFiles(dataDir);
+  const candidates = files
+    .filter((file) => /chat-\d+-[a-f0-9]+-(prompt|last-message)\.txt$/i.test(path.basename(file)))
+    .sort((a, b) => statMtimeMs(b) - statMtimeMs(a));
+  await removeOldPaths(candidates, cutoff, retentionMaxDataFiles);
+  const attachmentDirs = (await listDirectories(dataDir))
+    .filter((dir) => /^chat-\d+-[a-f0-9]+-attachments$/i.test(path.basename(dir)));
+  await removeOldPaths(attachmentDirs, cutoff, retentionMaxOutputDirs);
+}
+
+async function cleanupOldOutputDirs(cutoff) {
+  const dirs = (await listDirectories(outputRoot))
+    .filter((dir) => /^chat-\d+-[a-f0-9]+$/i.test(path.basename(dir)))
+    .sort((a, b) => statMtimeMs(b) - statMtimeMs(a));
+  await removeOldPaths(dirs, cutoff, retentionMaxOutputDirs);
+}
+
+async function cleanupOldCodexGeneratedImages(cutoff) {
+  for (const root of codexGeneratedImageRoots()) {
+    const dirs = (await listDirectories(root))
+      .sort((a, b) => statMtimeMs(b) - statMtimeMs(a));
+    await removeOldPaths(dirs, cutoff, retentionMaxOutputDirs);
+  }
+}
+
+async function removeOldPaths(paths, cutoff, keepNewest) {
+  for (let index = 0; index < paths.length; index += 1) {
+    const itemPath = paths[index];
+    if (index < keepNewest && statMtimeMs(itemPath) >= cutoff) continue;
+    await fs.rm(itemPath, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function listFiles(root) {
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    return entries.filter((entry) => entry.isFile()).map((entry) => path.join(root, entry.name));
+  } catch {
+    return [];
+  }
+}
+
+async function listDirectories(root) {
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    return entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(root, entry.name));
+  } catch {
+    return [];
+  }
+}
+
+function extractImagePaths(text) {
+  const value = String(text || "");
+  const matches = value.match(/(?:[a-zA-Z]:\\|\/|\.{1,2}[\\/])[^`"'<>|\r\n]+?\.(?:png|jpe?g|webp|gif)/gi) || [];
+  return [...new Set(matches.map((item) => item.trim()))];
+}
+
+function resolveReferencedImagePath(imagePath, workspaceRoot = __dirname) {
+  const value = String(imagePath || "").trim();
+  if (!value) return "";
+  if (path.isAbsolute(value)) return path.normalize(value);
+  const candidates = [
+    path.resolve(workspaceRoot, value),
+    path.resolve(__dirname, value)
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
+}
+
+function uniqueAssetFileName(dir, fileName) {
+  const safeName = String(fileName || "image.png").replace(/[<>:"/\\|?*\x00-\x1f]+/g, "_");
+  const ext = path.extname(safeName) || ".png";
+  const base = path.basename(safeName, ext) || "image";
+  let candidate = `${base}${ext}`;
+  let index = 1;
+  while (existsSync(path.join(dir, candidate))) {
+    candidate = `${base}-${index}${ext}`;
+    index += 1;
+  }
+  return candidate;
 }
 
 async function readImageDimensions(filePath) {
@@ -532,7 +800,7 @@ function isImageRequest(payload) {
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const lastUser = messages.slice().reverse().find((message) => String(message?.role || "") === "user");
   const text = normalizeContent(lastUser?.content || payload?.prompt || payload?.question || "");
-  const hasImageWord = /(图片|图像|插画|照片|头像|海报|壁纸|竖屏|横屏|image|picture|photo|illustration|wallpaper)/i.test(text);
+  const hasImageWord = /(图片|图像|插画|照片|头像|海报|壁纸|竖屏|横屏|风景图|场景图|配图|效果图|示意图|图|image|picture|photo|illustration|wallpaper)/i.test(text);
   const hasCreateWord = /(生成|画|绘制|做|出|来一张|给我一张|create|generate|draw|make)/i.test(text);
   return hasImageWord && hasCreateWord;
 }
@@ -614,34 +882,107 @@ function terminateProcessTree(child) {
 function emitCodexOutput(onEvent, source, text) {
   const clean = String(text || "").replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").trim();
   if (!clean) return;
-  const chunks = clean.split(/\r?\n/).filter(Boolean).slice(-8);
+  if (source === "stderr") return;
+  const chunks = clean.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => shouldEmitCodexOutputLine(line))
+    .slice(-4);
   for (const line of chunks) {
     onEvent({
-      type: "codex_output",
+      type: "progress",
       status: "running",
-      title: source === "stderr" ? "Codex log" : "Codex output",
-      source,
-      content: trimText(line, 2000)
+      title: "进展",
+      content: trimText(line, 1200)
     });
   }
 }
 
+function shouldEmitCodexOutputLine(line) {
+  const value = String(line || "").trim();
+  if (!value) return false;
+  if (/^(tokens used|codex|[-`'\s./\\\w:,]+|[\d,]+)$/i.test(value)) return false;
+  if (/^[-`'\s]*[^一-龥]{1,100}[-`'\s]*$/i.test(value)) return false;
+  if (isCodeLikeOutput(value)) return false;
+  return /[\u4e00-\u9fa5]/.test(value);
+}
+
+function isCodeLikeOutput(value) {
+  const text = String(value || "").trim();
+  if (/^```/.test(text)) return true;
+  if (/^\d{1,6}:\s*\S/.test(text)) return true;
+  if (/^<\/?[a-z][\w:-]*(\s|>|\/>)/i.test(text)) return true;
+  if (/<[a-z][\w:-]*(\s[^>]*)?>.*<\/[a-z][\w:-]*>/i.test(text)) return true;
+  if (/[{};]\s*$/.test(text) && /(const|let|var|function|return|if|else|class|=>|=)/.test(text)) return true;
+  return false;
+}
+
 function collectChangedFiles(workspaceRoot) {
   try {
-    const result = spawnSync("git", ["status", "--short"], {
+    const statusResult = spawnSync("git", ["status", "--short"], {
       cwd: workspaceRoot,
       windowsHide: true,
       encoding: "utf8"
     });
-    if (result.status !== 0) return [];
-    return String(result.stdout || "")
+    if (statusResult.status !== 0) return [];
+    const statusEntries = String(statusResult.stdout || "")
       .split(/\r?\n/)
-      .map(line => line.trim())
+      .map(parseGitStatusLine)
       .filter(Boolean)
       .slice(0, 80);
+    const stats = collectGitNumstat(workspaceRoot);
+    return statusEntries.map((entry) => ({
+      ...entry,
+      ...(stats.get(entry.path) || {})
+    }));
   } catch {
     return [];
   }
+}
+
+function parseGitStatusLine(line) {
+  const value = String(line || "");
+  if (!value.trim()) return null;
+  const status = value.slice(0, 2).trim() || "M";
+  let filePath = value.slice(3).trim();
+  if (filePath.includes(" -> ")) filePath = filePath.split(" -> ").pop().trim();
+  return filePath ? { status, path: filePath } : null;
+}
+
+function collectGitNumstat(workspaceRoot) {
+  const stats = new Map();
+  for (const args of [["diff", "--numstat"], ["diff", "--cached", "--numstat"]]) {
+    try {
+      const result = spawnSync("git", args, {
+        cwd: workspaceRoot,
+        windowsHide: true,
+        encoding: "utf8"
+      });
+      if (result.status !== 0) continue;
+      String(result.stdout || "").split(/\r?\n/).forEach((line) => {
+        const parts = line.split(/\t+/);
+        if (parts.length < 3) return;
+        const added = Number(parts[0]);
+        const deleted = Number(parts[1]);
+        let filePath = parts.slice(2).join("\t").trim();
+        if (filePath.includes(" => ")) filePath = filePath.replace(/.* => /, "").replace(/[{}]/g, "");
+        const current = stats.get(filePath) || { added: 0, deleted: 0 };
+        stats.set(filePath, {
+          added: current.added + (Number.isFinite(added) ? added : 0),
+          deleted: current.deleted + (Number.isFinite(deleted) ? deleted : 0)
+        });
+      });
+    } catch {}
+  }
+  return stats;
+}
+
+function formatChangedFiles(files) {
+  return files.map((file) => {
+    const added = Number(file.added || 0);
+    const deleted = Number(file.deleted || 0);
+    const stats = added || deleted ? ` +${added} -${deleted}` : "";
+    return `${file.path}${stats}`;
+  }).join("\n");
 }
 
 function resolveCodexCommand() {
@@ -755,6 +1096,9 @@ function resolveSandboxMode(payload, options = {}) {
   if (options.workspaceAllowed) {
     return codexElevatedSandboxMode;
   }
+  if (options.wantsImage) {
+    return "workspace-write";
+  }
   return "read-only";
 }
 
@@ -762,6 +1106,10 @@ function canOperateWorkspace(payload) {
   return payload?.codexElevated === true
     && normalizeAccessLevel(payload) === "lv1"
     && isWenyuan(payload);
+}
+
+function hasRequestedWorkspace(payload) {
+  return Boolean(String(payload?.workspaceRoot || payload?.workspacePath || payload?.codexWorkspaceRoot || "").trim());
 }
 
 function normalizeAccessLevel(payload) {
@@ -871,3 +1219,4 @@ function normalizeSandboxMode(value) {
 function errorMessage(error) {
   return error?.message || String(error || "Unknown error");
 }
+

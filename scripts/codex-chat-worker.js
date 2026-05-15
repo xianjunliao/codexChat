@@ -27,6 +27,10 @@ let lastWorkspaceSyncAt = 0;
 
 await fs.mkdir(path.join(projectRoot, "logs"), { recursive: true });
 await fs.mkdir(completionOutboxDir, { recursive: true });
+if (requiresWorkerToken(lifeBaseUrl) && (!workerToken || workerToken === "change-me")) {
+  log("Codex chat worker stopped: CODEX_CHAT_WORKER_TOKEN is missing or still set to change-me.");
+  process.exit(1);
+}
 await acquireWorkerLock();
 log(`Codex chat worker started. life=${lifeBaseUrl} chat=${chatBaseUrl} chatTimeoutMs=${chatRequestTimeoutMs} lifeTimeoutMs=${lifeRequestTimeoutMs}`);
 
@@ -90,12 +94,25 @@ async function processJob(job) {
     const message = chatResponse.choices?.[0]?.message || {};
     let assets = Array.isArray(message.assets) ? message.assets : (Array.isArray(chatResponse.assets) ? chatResponse.assets : []);
     if (uploadToLife && assets.length) {
+      const localAssets = assets;
+      await postCodexEvent(requestId, {
+        type: "progress",
+        status: "running",
+        title: "正在上传到 life",
+        content: `正在上传 ${assets.length} 个生成资源`
+      }).catch(() => {});
       assets = await uploadAssetsToLife(assets);
+      await cleanupLocalAssets(localAssets, assets);
+      assets = compactAssetsForLife(assets);
       chatResponse.assets = assets;
       if (chatResponse.choices?.[0]?.message) {
         chatResponse.choices[0].message.assets = assets;
       }
     }
+    await postFinalEvent(requestId, {
+      content: message.content || "",
+      assets
+    });
     await deliverCompletion(requestId, "complete", {
       assistantText: message.content || "",
       responseJson: chatResponse,
@@ -184,10 +201,24 @@ async function tryProcessJobStream(job, requestPayload, startedAt) {
       assets
     };
     if (uploadToLife && assets.length) {
+      const localAssets = assets;
+      await postCodexEvent(requestId, {
+        type: "progress",
+        status: "running",
+        title: "正在上传到 life",
+        content: `正在上传 ${assets.length} 个生成资源`
+      }).catch(() => {});
       assets = await uploadAssetsToLife(assets);
+      await cleanupLocalAssets(localAssets, assets);
+      assets = compactAssetsForLife(assets);
       chatResponse.assets = assets;
       chatResponse.choices[0].message.assets = assets;
     }
+    await postFinalEvent(requestId, {
+      ...finalEvent,
+      content: assistantText,
+      assets
+    });
     await deliverCompletion(requestId, "complete", {
       assistantText,
       responseJson: chatResponse,
@@ -210,6 +241,17 @@ async function postCodexEvent(requestId, event) {
   return await postJson(`${lifeBaseUrl}/api/codex-chat/worker/jobs/${encodeURIComponent(requestId)}/events`, {
     event
   });
+}
+
+async function postFinalEvent(requestId, event) {
+  if (!requestId) return null;
+  const finalEvent = {
+    ...event,
+    type: "final",
+    status: "done"
+  };
+  return await postCodexEvent(requestId, finalEvent)
+    .catch((error) => log(`Final event delivery failed ${requestId}: ${errorMessage(error)}`));
 }
 
 async function deliverCompletion(requestId, kind, payload) {
@@ -266,8 +308,25 @@ async function prepareCompletionPayload(payload) {
   let assets = Array.isArray(payload.assets)
     ? payload.assets
     : (Array.isArray(response?.assets) ? response.assets : (Array.isArray(response?.choices?.[0]?.message?.assets) ? response.choices[0].message.assets : []));
-  if (!assets.length || assets.every((asset) => asset?.uploaded === true || asset?.downloadId)) return payload;
+  if (!assets.length) return payload;
+  if (assets.every((asset) => asset?.uploaded === true || asset?.downloadId)) {
+    assets = compactAssetsForLife(assets);
+    if (response && typeof response === "object") {
+      response.assets = assets;
+      if (response.choices?.[0]?.message) {
+        response.choices[0].message.assets = assets;
+      }
+    }
+    return {
+      ...payload,
+      assets,
+      responseJson: response && Object.keys(response).length ? response : payload.responseJson
+    };
+  }
+  const localAssets = assets;
   assets = await uploadAssetsToLife(assets);
+  await cleanupLocalAssets(localAssets, assets);
+  assets = compactAssetsForLife(assets);
   if (response && typeof response === "object") {
     response.assets = assets;
     if (response.choices?.[0]?.message) {
@@ -339,7 +398,7 @@ async function uploadAssetsToLife(assets) {
       }
       const downloadId = data.data?.downloadId || "";
       uploaded.push({
-        ...asset,
+        ...compactAssetForLife(asset),
         uploaded: true,
         downloadId,
         fileSize: data.data?.fileSize || asset.fileSize || "",
@@ -349,13 +408,52 @@ async function uploadAssetsToLife(assets) {
       });
     } catch (error) {
       uploaded.push({
-        ...asset,
+        ...compactAssetForLife(asset),
         uploaded: false,
         uploadError: errorMessage(error)
       });
     }
   }
   return uploaded;
+}
+
+function compactAssetsForLife(assets) {
+  return Array.isArray(assets) ? assets.map(compactAssetForLife) : [];
+}
+
+function compactAssetForLife(asset) {
+  if (!asset || typeof asset !== "object") return asset;
+  const { dataUrl, path: localPath, localUrl, ...rest } = asset;
+  return rest;
+}
+
+async function cleanupLocalAssets(localAssets, uploadedAssets = []) {
+  const requestIds = new Set();
+  const uploadedByName = new Set(
+    (Array.isArray(uploadedAssets) ? uploadedAssets : [])
+      .filter((asset) => asset?.uploaded)
+      .map((asset) => String(asset.fileName || "").toLowerCase())
+      .filter(Boolean)
+  );
+  const anyUploaded = (Array.isArray(uploadedAssets) ? uploadedAssets : []).some((asset) => asset?.uploaded);
+  for (const asset of Array.isArray(localAssets) ? localAssets : []) {
+    if (!anyUploaded) continue;
+    if (uploadedByName.size && asset?.fileName && !uploadedByName.has(String(asset.fileName).toLowerCase())) continue;
+    const match = String(asset.url || "").match(/\/outputs\/([^/]+)/);
+    if (match) requestIds.add(decodeURIComponent(match[1]));
+  }
+  for (const requestId of requestIds) {
+    try {
+      await requestJson(`${chatBaseUrl}/outputs/${encodeURIComponent(requestId)}`, {
+        method: "DELETE",
+        headers: {},
+        timeoutMs: lifeRequestTimeoutMs
+      });
+      log(`Cleaned local output ${requestId}`);
+    } catch (error) {
+      log(`Local output cleanup failed ${requestId}: ${errorMessage(error)}`);
+    }
+  }
 }
 
 function absoluteAssetUrl(url) {
@@ -420,6 +518,14 @@ function requestJson(url, options = {}) {
       headers["Content-Length"] = Buffer.byteLength(body);
     }
     const timeoutMs = parseTimeoutMs(options.timeoutMs, lifeRequestTimeoutMs);
+    let settled = false;
+    let hardTimer = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (hardTimer) clearTimeout(hardTimer);
+      fn(value);
+    };
     const request = (isHttps ? https : http).request({
       method: options.method || "GET",
       protocol: target.protocol,
@@ -439,13 +545,19 @@ function requestJson(url, options = {}) {
         } catch {
           data = {};
         }
-        resolve({ status: response.statusCode || 0, data, text });
+        finish(resolve, { status: response.statusCode || 0, data, text });
       });
+      response.on("error", error => finish(reject, error));
     });
+    if (timeoutMs > 0) {
+      hardTimer = setTimeout(() => {
+        request.destroy(new Error(`request hard timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+      }, timeoutMs + 1000);
+    }
     request.on("timeout", () => {
       request.destroy(new Error(`request timed out after ${Math.round(timeoutMs / 1000)} seconds`));
     });
-    request.on("error", reject);
+    request.on("error", error => finish(reject, error));
     if (body) request.write(body);
     request.end();
   });
@@ -481,6 +593,15 @@ function parseTimeoutMs(value, fallback) {
   if (value == null || value === "") return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function requiresWorkerToken(url) {
+  try {
+    const host = new URL(url).hostname;
+    return !/^(localhost|127\.0\.0\.1|::1)$/i.test(host);
+  } catch {
+    return true;
+  }
 }
 
 function trimText(text, max) {
