@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "start:local": "powershell -ExecutionPolicy Bypass -File scripts/start-local-services.ps1",
+    "start:local:once": "powershell -ExecutionPolicy Bypass -File scripts/start-local-services.ps1 -NoFollowLogs",
     "dev": "node server.js",
     "worker": "node scripts/codex-chat-worker.js",
     "worker:once": "node scripts/codex-chat-worker.js --once"

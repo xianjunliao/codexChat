@@ -8,7 +8,8 @@ param(
     [string]$CodexElevatedSandboxMode = "danger-full-access",
     [int]$LongTaskTimeoutMinutes = 60,
     [int]$WorkerChatTimeoutMinutes = 65,
-    [int]$LifeRequestTimeoutSeconds = 60
+    [int]$LifeRequestTimeoutSeconds = 60,
+    [switch]$SkipWorker
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,6 +20,39 @@ New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 if ([string]::IsNullOrWhiteSpace($PublicLifeBaseUrl)) {
     $PublicLifeBaseUrl = $LifeBaseUrl
+}
+
+function Import-LocalWorkerToken {
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_CHAT_WORKER_TOKEN)) {
+        return $env:CODEX_CHAT_WORKER_TOKEN
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_MEDIA_WORKER_TOKEN)) {
+        return $env:CODEX_MEDIA_WORKER_TOKEN
+    }
+    $siblingEnv = Join-Path (Split-Path -Parent $ProjectRoot) "codexImages\.env"
+    if (-not (Test-Path -LiteralPath $siblingEnv)) {
+        return ""
+    }
+    $token = ""
+    Get-Content -LiteralPath $siblingEnv -Encoding UTF8 | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#") -and $line.Contains("=")) {
+            $name, $value = $line.Split("=", 2)
+            $cleanName = $name.Trim().TrimStart([char]0xFEFF)
+            if (($cleanName -eq "CODEX_CHAT_WORKER_TOKEN" -or $cleanName -eq "CODEX_MEDIA_WORKER_TOKEN") -and [string]::IsNullOrWhiteSpace($token)) {
+                $token = $value.Trim()
+            }
+        }
+    }
+    return $token
+}
+
+if ([string]::IsNullOrWhiteSpace($WorkerToken) -or $WorkerToken -eq "change-me") {
+    $localWorkerToken = Import-LocalWorkerToken
+    if (-not [string]::IsNullOrWhiteSpace($localWorkerToken)) {
+        $WorkerToken = $localWorkerToken
+        Write-Host "Loaded Codex chat worker token from local environment."
+    }
 }
 
 $NodePath = "node"
@@ -155,12 +189,16 @@ if ($null -ne $Health -and $Health.version -eq $ExpectedServiceVersion -and $Hea
     Start-Sleep -Seconds 2
 }
 
-Start-NodeProcess `
-    -Name "ChatGPT worker" `
-    -Arguments @("scripts/codex-chat-worker.js") `
-    -PidFile $WorkerPid `
-    -OutFile (Join-Path $LogDir "worker.out.log") `
-    -ErrFile (Join-Path $LogDir "worker.err.log")
+if ($SkipWorker) {
+    Write-Host "ChatGPT worker skipped."
+} else {
+    Start-NodeProcess `
+        -Name "ChatGPT worker" `
+        -Arguments @("scripts/codex-chat-worker.js") `
+        -PidFile $WorkerPid `
+        -OutFile (Join-Path $LogDir "worker.out.log") `
+        -ErrFile (Join-Path $LogDir "worker.err.log")
+}
 
 Write-Host "Life URL: $($env:LIFE_BASE_URL)"
 Write-Host "Public Life URL: $($env:CODEX_CHAT_PUBLIC_LIFE_BASE_URL)"
