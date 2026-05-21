@@ -1,9 +1,8 @@
 param(
     [string]$TaskName = "CodexChatService",
     [string]$LifeBaseUrl = "https://www.liaoxianjun.com",
-    [string]$PublicLifeBaseUrl = "",
-    [string]$WorkerToken = "change-me",
-    [switch]$AllowLocalLifeBaseUrl
+    [string]$PublicLifeBaseUrl = "https://www.liaoxianjun.com",
+    [string]$WorkerToken = "life-2a13f1c17d3940a95874e73f7f0446b70f3de8f6d12ff398"
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,36 +16,14 @@ if ([string]::IsNullOrWhiteSpace($PublicLifeBaseUrl)) {
     $PublicLifeBaseUrl = $LifeBaseUrl
 }
 
-function Test-LocalLifeBaseUrl {
-    param([string]$Url)
-    try {
-        $hostName = ([Uri]$Url).Host.ToLowerInvariant()
-        return $hostName -eq "127.0.0.1" -or $hostName -eq "localhost" -or $hostName -eq "::1"
-    } catch {
-        return $false
-    }
-}
-
-if ((Test-LocalLifeBaseUrl $LifeBaseUrl) -and -not $AllowLocalLifeBaseUrl) {
-    Write-Host "LifeBaseUrl '$LifeBaseUrl' is local; scheduled worker will use https://www.liaoxianjun.com. Pass -AllowLocalLifeBaseUrl for local debugging."
-    $LifeBaseUrl = "https://www.liaoxianjun.com"
-    if ((Test-LocalLifeBaseUrl $PublicLifeBaseUrl)) {
-        $PublicLifeBaseUrl = $LifeBaseUrl
-    }
-}
-
-$argumentParts = @(
+$arguments = @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
     "-File", "`"$StartScript`"",
     "-LifeBaseUrl", "`"$LifeBaseUrl`"",
     "-PublicLifeBaseUrl", "`"$PublicLifeBaseUrl`"",
     "-WorkerToken", "`"$WorkerToken`""
-)
-if ($AllowLocalLifeBaseUrl) {
-    $argumentParts += "-AllowLocalLifeBaseUrl"
-}
-$arguments = $argumentParts -join " "
+) -join " "
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
 $startupTrigger = New-ScheduledTaskTrigger -AtStartup

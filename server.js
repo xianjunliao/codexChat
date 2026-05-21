@@ -7,15 +7,16 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+loadEnvFile(path.join(__dirname, ".env"));
 const publicDir = path.join(__dirname, "public");
 const dataDir = path.join(__dirname, "data");
 const outputRoot = path.join(__dirname, "generated", "codex-chat");
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 3037);
 const publicBaseUrl = `http://${host}:${port}`;
-const serviceVersion = "20260513-image-assets-v2";
+const serviceVersion = "20260521-env-command-and-change-baseline-v2";
 const serviceModel = process.env.CODEX_CHAT_MODEL || "chatgpt";
-const codexCommand = process.env.CODEX_COMMAND || resolveCodexCommand();
+const codexCommand = resolveCodexCommand(process.env.CODEX_COMMAND);
 const codexTimeoutMs = parseTimeoutMs(process.env.CODEX_CHAT_TIMEOUT_MS, 60 * 60 * 1000);
 const codexSandboxMode = normalizeSandboxMode(process.env.CODEX_CHAT_SANDBOX_MODE || "workspace-write");
 const codexElevatedSandboxMode = normalizeSandboxMode(process.env.CODEX_CHAT_ELEVATED_SANDBOX_MODE || "danger-full-access");
@@ -36,6 +37,22 @@ await fs.mkdir(dataDir, { recursive: true });
 await fs.mkdir(publicDir, { recursive: true });
 await fs.mkdir(outputRoot, { recursive: true });
 scheduleRuntimeCleanup();
+
+function loadEnvFile(filePath) {
+  if (!existsSync(filePath)) return;
+  const text = readFileSync(filePath, "utf8");
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) continue;
+    const index = trimmed.indexOf("=");
+    const key = trimmed.slice(0, index).trim().replace(/^\uFEFF/, "");
+    let value = trimmed.slice(index + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key && !process.env[key]) process.env[key] = value;
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -185,9 +202,11 @@ async function runCodexChat(payload, onEvent = () => {}) {
   const requestStartedAt = Date.now();
   const requestId = "chat-" + Date.now() + "-" + crypto.randomBytes(4).toString("hex");
   const wantsImage = isImageRequest(payload);
+  const imageCount = wantsImage ? requestedImageCount(payload) : 0;
   const workspaceAllowed = canOperateWorkspace(payload) && hasRequestedWorkspace(payload);
   const workspaceRoot = resolveWorkspaceRoot(payload, { workspaceAllowed });
   const sandboxMode = resolveSandboxMode(payload, { workspaceAllowed, wantsImage });
+  const changedFilesBefore = workspaceAllowed ? collectChangedFiles(workspaceRoot) : [];
   const imageNamePrefix = wantsImage ? `image-${Date.now()}-${crypto.randomBytes(4).toString("hex")}` : "";
   const outputDir = path.join(outputRoot, requestId);
   const attachmentDir = path.join(dataDir, `${requestId}-attachments`);
@@ -203,7 +222,7 @@ async function runCodexChat(payload, onEvent = () => {}) {
   });
   const promptFile = path.join(dataDir, `${requestId}-prompt.txt`);
   const lastMessageFile = path.join(dataDir, `${requestId}-last-message.txt`);
-  await fs.writeFile(promptFile, buildPrompt(payload, { wantsImage, outputDir, requestId, imageNamePrefix, workspaceRoot, sandboxMode, imageAttachments, workspaceAllowed }), "utf8");
+  await fs.writeFile(promptFile, buildPrompt(payload, { wantsImage, imageCount, outputDir, requestId, imageNamePrefix, workspaceRoot, sandboxMode, imageAttachments, workspaceAllowed }), "utf8");
   const hasLocalImageAttachments = imageAttachments.some((attachment) => !attachment.remote);
   onEvent({
     type: "progress",
@@ -249,7 +268,7 @@ async function runCodexChat(payload, onEvent = () => {}) {
     scheduleOutputRequestCleanup(requestId);
   }
   if (workspaceAllowed) {
-    const changedFiles = collectChangedFiles(workspaceRoot);
+    const changedFiles = collectChangedFiles(workspaceRoot, changedFilesBefore);
     if (changedFiles.length) {
       onEvent({
         type: "file_change",
@@ -342,7 +361,7 @@ function buildPrompt(payload, options = {}) {
     options.imageAttachments?.length ? formatImageAttachmentPrompt(options.imageAttachments) : "",
     `Codex sandbox mode: ${options.sandboxMode || codexSandboxMode}`,
     options.wantsImage ? `Output directory: ${options.outputDir}` : "",
-    options.wantsImage ? `Save images with unique filenames starting with ${options.imageNamePrefix}, for example ${options.imageNamePrefix}-01.png. Do not use generic names like image-0001.png. If image generation is unavailable or no file can be written, fail clearly instead of returning a successful text description.` : "",
+    options.wantsImage ? `Requested image count: ${options.imageCount || 1}. Save each generated image as a separate standalone file with a unique filename starting with ${options.imageNamePrefix}, for example ${options.imageNamePrefix}-01.png. If the user asks for multiple images, create multiple independent files, not a collage, grid, contact sheet, split-screen, or multi-panel image. Do not use generic names like image-0001.png. If image generation is unavailable or no file can be written, fail clearly instead of returning a successful text description.` : "",
     options.wantsImage ? "" : "",
     normalized.length ? normalized.join("\n\n") : `USER:\n${fallback}`,
     "",
@@ -800,9 +819,35 @@ function isImageRequest(payload) {
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const lastUser = messages.slice().reverse().find((message) => String(message?.role || "") === "user");
   const text = normalizeContent(lastUser?.content || payload?.prompt || payload?.question || "");
+  if (isImageWorkflowQuestion(text)) return false;
   const hasImageWord = /(图片|图像|插画|照片|头像|海报|壁纸|竖屏|横屏|风景图|场景图|配图|效果图|示意图|图|image|picture|photo|illustration|wallpaper)/i.test(text);
   const hasCreateWord = /(生成|画|绘制|做|出|来一张|给我一张|create|generate|draw|make)/i.test(text);
   return hasImageWord && hasCreateWord;
+}
+
+function isImageWorkflowQuestion(text) {
+  return /(图片生成|生成图片|生图)[^，。！？\n]{0,30}(时|时候|过程|期间|功能|页面|对话区|滚动条|原因|问题|失败|报错|异常|bug|逻辑|代码|排查|看下|检查|修复|优化|跳动)/i.test(text)
+    || /(为什么|原因|怎么回事|看下|检查|排查|修复|调试|优化|报错|失败|异常|问题|bug)[^，。！？\n]{0,40}(图片生成|生成图片|生图)/i.test(text);
+}
+
+function requestedImageCount(payload) {
+  const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+  const lastUser = messages.slice().reverse().find((message) => String(message?.role || "") === "user");
+  const text = normalizeContent(lastUser?.content || payload?.prompt || payload?.question || "");
+  const digitMatch = text.match(/(?:生成|画|绘制|做|出|来|给我|create|generate|draw|make)?\s*(\d+)\s*(?:张|幅|个|份|images?|pictures?|photos?)/i);
+  if (digitMatch) return clampImageCount(Number(digitMatch[1]));
+  const reversedDigitMatch = text.match(/(?:images?|pictures?|photos?)\s*(?:数量|count|num|number)?\s*[:：=]?\s*(\d+)/i);
+  if (reversedDigitMatch) return clampImageCount(Number(reversedDigitMatch[1]));
+  if (/\b(two)\s+(?:images?|pictures?|photos?)\b/i.test(text) || /(?:两|二)\s*(?:张|幅|个|份)/.test(text)) return 2;
+  if (/\b(three)\s+(?:images?|pictures?|photos?)\b/i.test(text) || /三\s*(?:张|幅|个|份)/.test(text)) return 3;
+  if (/\b(four)\s+(?:images?|pictures?|photos?)\b/i.test(text) || /四\s*(?:张|幅|个|份)/.test(text)) return 4;
+  return 1;
+}
+
+function clampImageCount(value) {
+  const number = Math.round(Number(value));
+  if (!Number.isFinite(number) || number <= 0) return 1;
+  return Math.max(1, Math.min(4, number));
 }
 
 async function readJson(req) {
@@ -916,7 +961,7 @@ function isCodeLikeOutput(value) {
   return false;
 }
 
-function collectChangedFiles(workspaceRoot) {
+function collectChangedFiles(workspaceRoot, baseline = []) {
   try {
     const statusResult = spawnSync("git", ["status", "--short"], {
       cwd: workspaceRoot,
@@ -930,13 +975,27 @@ function collectChangedFiles(workspaceRoot) {
       .filter(Boolean)
       .slice(0, 80);
     const stats = collectGitNumstat(workspaceRoot);
-    return statusEntries.map((entry) => ({
+    const files = statusEntries.map((entry) => ({
       ...entry,
       ...(stats.get(entry.path) || {})
     }));
+    const baselineMap = new Map(
+      (Array.isArray(baseline) ? baseline : []).map((entry) => [entry.path, changedFileSignature(entry)])
+    );
+    if (!baselineMap.size) return files;
+    return files.filter((entry) => baselineMap.get(entry.path) !== changedFileSignature(entry));
   } catch {
     return [];
   }
+}
+
+function changedFileSignature(entry) {
+  return [
+    String(entry?.status || ""),
+    String(entry?.path || ""),
+    Number(entry?.added || 0),
+    Number(entry?.deleted || 0)
+  ].join("|");
 }
 
 function parseGitStatusLine(line) {
@@ -985,11 +1044,17 @@ function formatChangedFiles(files) {
   }).join("\n");
 }
 
-function resolveCodexCommand() {
+function resolveCodexCommand(preferred = "") {
+  const normalizedPreferred = String(preferred || "").trim();
+  const bareCodexCommand = normalizedPreferred
+    && !/[\\/]/.test(normalizedPreferred)
+    && /^codex(?:\.cmd|\.bat|\.exe)?$/i.test(normalizedPreferred);
   const candidates = [
+    normalizedPreferred && !bareCodexCommand ? normalizedPreferred : "",
     process.env.NVM_SYMLINK ? path.join(process.env.NVM_SYMLINK, "codex.cmd") : "",
     "E:\\nvm4w\\nodejs\\codex.cmd",
     "C:\\Program Files\\nodejs\\codex.cmd",
+    bareCodexCommand ? normalizedPreferred : "",
     "codex"
   ].filter(Boolean);
   for (const candidate of candidates) {

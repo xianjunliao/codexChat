@@ -7,8 +7,9 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
+loadEnvFile(path.join(projectRoot, ".env"));
 
-const lifeBaseUrl = (process.env.LIFE_BASE_URL || "http://127.0.0.1:8080").replace(/\/$/, "");
+const lifeBaseUrl = (process.env.LIFE_BASE_URL || "https://www.liaoxianjun.com").replace(/\/$/, "");
 const publicLifeBaseUrl = (process.env.CODEX_CHAT_PUBLIC_LIFE_BASE_URL || lifeBaseUrl).replace(/\/$/, "");
 const chatBaseUrl = (process.env.CHATGPT_BASE_URL || "http://127.0.0.1:3037").replace(/\/$/, "");
 const workerToken = process.env.CODEX_CHAT_WORKER_TOKEN || "";
@@ -18,12 +19,31 @@ const lifeRequestTimeoutMs = parseTimeoutMs(process.env.CODEX_CHAT_LIFE_REQUEST_
 const chatRequestTimeoutMs = parseTimeoutMs(process.env.CODEX_CHAT_REQUEST_TIMEOUT_MS, 65 * 60 * 1000);
 const requestRetries = Number(process.env.CODEX_CHAT_REQUEST_RETRIES || 2);
 const once = process.argv.includes("--once");
-const uploadToLife = String(process.env.CODEX_CHAT_UPLOAD_TO_LIFE || "true").toLowerCase() !== "false";
+const useLocalMediaRelay = String(process.env.CODEX_CHAT_USE_LOCAL_MEDIA_RELAY || "true").toLowerCase() !== "false";
+const uploadToLife = !useLocalMediaRelay && String(process.env.CODEX_CHAT_UPLOAD_TO_LIFE || "false").toLowerCase() !== "false";
 const uploadThemeName = process.env.CODEX_CHAT_UPLOAD_THEME || "CodexChat";
+const localImageDir = process.env.LIFE_MEDIA_IMAGE_DIR || "E:\\lifeFiles\\images";
+const localVideoDir = process.env.LIFE_MEDIA_VIDEO_DIR || "E:\\lifeFiles\\video";
 const logFile = path.join(projectRoot, "logs", "codex-chat-worker.log");
 const lockFile = path.join(projectRoot, "logs", "codex-chat-worker.pid");
 const completionOutboxDir = path.join(projectRoot, "data", "codex-chat-completions");
 let lastWorkspaceSyncAt = 0;
+
+function loadEnvFile(filePath) {
+  if (!fsSync.existsSync(filePath)) return;
+  const text = fsSync.readFileSync(filePath, "utf8");
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) continue;
+    const index = trimmed.indexOf("=");
+    const key = trimmed.slice(0, index).trim().replace(/^\uFEFF/, "");
+    let value = trimmed.slice(index + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key && !process.env[key]) process.env[key] = value;
+  }
+}
 
 await fs.mkdir(path.join(projectRoot, "logs"), { recursive: true });
 await fs.mkdir(completionOutboxDir, { recursive: true });
@@ -93,15 +113,15 @@ async function processJob(job) {
     }, { workerToken: false });
     const message = chatResponse.choices?.[0]?.message || {};
     let assets = Array.isArray(message.assets) ? message.assets : (Array.isArray(chatResponse.assets) ? chatResponse.assets : []);
-    if (uploadToLife && assets.length) {
+    if (assets.length && (useLocalMediaRelay || uploadToLife)) {
       const localAssets = assets;
       await postCodexEvent(requestId, {
         type: "progress",
         status: "running",
-        title: "正在上传到 life",
-        content: `正在上传 ${assets.length} 个生成资源`
+        title: useLocalMediaRelay ? "正在登记本地媒体" : "正在上传到 life",
+        content: useLocalMediaRelay ? `正在保存 ${assets.length} 个生成资源到本地媒体目录` : `正在上传 ${assets.length} 个生成资源`
       }).catch(() => {});
-      assets = await uploadAssetsToLife(assets);
+      assets = useLocalMediaRelay ? await localizeAssetsForLifeMediaRelay(assets, requestId) : await uploadAssetsToLife(assets);
       await cleanupLocalAssets(localAssets, assets);
       assets = compactAssetsForLife(assets);
       chatResponse.assets = assets;
@@ -200,15 +220,15 @@ async function tryProcessJobStream(job, requestPayload, startedAt) {
       }],
       assets
     };
-    if (uploadToLife && assets.length) {
+    if (assets.length && (useLocalMediaRelay || uploadToLife)) {
       const localAssets = assets;
       await postCodexEvent(requestId, {
         type: "progress",
         status: "running",
-        title: "正在上传到 life",
-        content: `正在上传 ${assets.length} 个生成资源`
+        title: useLocalMediaRelay ? "正在登记本地媒体" : "正在上传到 life",
+        content: useLocalMediaRelay ? `正在保存 ${assets.length} 个生成资源到本地媒体目录` : `正在上传 ${assets.length} 个生成资源`
       }).catch(() => {});
-      assets = await uploadAssetsToLife(assets);
+      assets = useLocalMediaRelay ? await localizeAssetsForLifeMediaRelay(assets, requestId) : await uploadAssetsToLife(assets);
       await cleanupLocalAssets(localAssets, assets);
       assets = compactAssetsForLife(assets);
       chatResponse.assets = assets;
@@ -297,19 +317,19 @@ async function postCompletionRecord(record) {
   const requestId = String(record?.requestId || "").trim();
   if (!requestId) throw new Error("completion requestId missing");
   const kind = record.kind === "error" ? "error" : "complete";
-  const payload = kind === "complete" ? await prepareCompletionPayload(record.payload || {}) : (record.payload || {});
+  const payload = kind === "complete" ? await prepareCompletionPayload(record.payload || {}, requestId) : (record.payload || {});
   return await postJson(`${lifeBaseUrl}/api/codex-chat/worker/jobs/${encodeURIComponent(requestId)}/${kind}`, payload);
 }
 
-async function prepareCompletionPayload(payload) {
-  if (!uploadToLife) return payload;
+async function prepareCompletionPayload(payload, requestId = "") {
+  if (!useLocalMediaRelay && !uploadToLife) return payload;
   const responseJson = payload.responseJson || {};
   const response = typeof responseJson === "string" ? parseJson(responseJson) : responseJson;
   let assets = Array.isArray(payload.assets)
     ? payload.assets
     : (Array.isArray(response?.assets) ? response.assets : (Array.isArray(response?.choices?.[0]?.message?.assets) ? response.choices[0].message.assets : []));
   if (!assets.length) return payload;
-  if (assets.every((asset) => asset?.uploaded === true || asset?.downloadId)) {
+  if (assets.every((asset) => asset?.localStored === true || asset?.uploaded === true || asset?.downloadId || asset?.localPath)) {
     assets = compactAssetsForLife(assets);
     if (response && typeof response === "object") {
       response.assets = assets;
@@ -324,7 +344,7 @@ async function prepareCompletionPayload(payload) {
     };
   }
   const localAssets = assets;
-  assets = await uploadAssetsToLife(assets);
+  assets = useLocalMediaRelay ? await localizeAssetsForLifeMediaRelay(assets, requestId) : await uploadAssetsToLife(assets);
   await cleanupLocalAssets(localAssets, assets);
   assets = compactAssetsForLife(assets);
   if (response && typeof response === "object") {
@@ -374,6 +394,113 @@ async function removeCompletionRecord(requestId) {
 function completionRecordPath(requestId) {
   const safeName = String(requestId || "").replace(/[^a-z0-9_.-]+/gi, "_") || "unknown";
   return path.join(completionOutboxDir, `${safeName}.json`);
+}
+
+async function localizeAssetsForLifeMediaRelay(assets, requestId = "") {
+  const localized = [];
+  const safeRequestId = safeFileSegment(requestId || `codex-chat-${Date.now()}`);
+  const dateSegment = localDateSegment();
+  for (const [index, asset] of (Array.isArray(assets) ? assets : []).entries()) {
+    try {
+      const fileNameHint = asset?.fileName || asset?.name || `codex-chat-${index + 1}.png`;
+      const typeHint = asset?.type || asset?.mimeType || contentType(fileNameHint);
+      const media = await readAssetMedia(asset, typeHint);
+      const mime = media.type || typeHint || contentType(fileNameHint);
+      const kind = String(mime).toLowerCase().startsWith("video/") ? "video" : "image";
+      const root = kind === "video" ? localVideoDir : localImageDir;
+      const targetDir = path.join(root, "codex-chat", dateSegment);
+      await fs.mkdir(targetDir, { recursive: true });
+      const ext = extensionForMime(mime, fileNameHint);
+      const baseName = stripExtension(path.basename(fileNameHint)) || `asset-${index + 1}`;
+      const fileName = `${safeRequestId}-${String(index + 1).padStart(2, "0")}-${safeFileSegment(baseName)}${ext}`;
+      const localPath = path.join(targetDir, fileName);
+      await fs.writeFile(localPath, media.buffer);
+      localized.push({
+        ...compactAssetForLife(asset),
+        localStored: true,
+        storage: "local",
+        provider: "codex-chat",
+        relayOnly: true,
+        kind,
+        fileName,
+        type: mime,
+        mimeType: mime,
+        size: media.buffer.length,
+        sizeBytes: media.buffer.length,
+        localPath,
+        path: localPath,
+        relativePath: relativeLifeMediaPath(localPath, root, kind),
+        url: "",
+        playUrl: ""
+      });
+    } catch (error) {
+      localized.push({
+        ...compactAssetForLife(asset),
+        localStored: false,
+        storageError: errorMessage(error)
+      });
+    }
+  }
+  return localized;
+}
+
+async function readAssetMedia(asset, typeHint = "image/png") {
+  const parsed = parseDataUrl(asset?.dataUrl || asset?.url || "");
+  if (parsed) return parsed;
+  const assetUrl = absoluteAssetUrl(asset?.url || "");
+  const response = await fetch(assetUrl);
+  if (!response.ok) throw new Error(`asset download failed: ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const type = response.headers.get("content-type") || typeHint || contentType(asset?.fileName || "");
+  return { buffer, type };
+}
+
+function parseDataUrl(value) {
+  const match = String(value || "").match(/^data:([^;,]+);base64,([\s\S]+)$/i);
+  if (!match) return null;
+  return {
+    type: match[1].toLowerCase(),
+    buffer: Buffer.from(match[2].replace(/\s+/g, ""), "base64")
+  };
+}
+
+function localDateSegment() {
+  const date = new Date();
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}${month}${day}`;
+}
+
+function safeFileSegment(value) {
+  const safe = String(value || "").replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  return safe || "asset";
+}
+
+function stripExtension(fileName) {
+  return String(fileName || "").replace(/\.[^.\\/]+$/, "");
+}
+
+function extensionForMime(mime, fallbackName = "") {
+  const lower = String(mime || "").toLowerCase();
+  if (lower.includes("jpeg") || lower.includes("jpg")) return ".jpg";
+  if (lower.includes("webp")) return ".webp";
+  if (lower.includes("gif")) return ".gif";
+  if (lower.includes("mp4")) return ".mp4";
+  if (lower.includes("webm")) return ".webm";
+  const ext = path.extname(String(fallbackName || "")).toLowerCase();
+  if (ext) return ext;
+  return lower.startsWith("video/") ? ".mp4" : ".png";
+}
+
+function relativeLifeMediaPath(localPath, root, kind) {
+  const normalizedPath = String(localPath || "").replace(/\\/g, "/");
+  const normalizedRoot = String(root || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  const prefix = kind === "video" ? "video" : "images";
+  if (normalizedRoot && normalizedPath.toLowerCase().startsWith(normalizedRoot.toLowerCase())) {
+    return `${prefix}/${normalizedPath.slice(normalizedRoot.length).replace(/^\/+/, "")}`;
+  }
+  return `${prefix}/${path.basename(localPath || "")}`;
 }
 
 async function uploadAssetsToLife(assets) {
@@ -431,14 +558,15 @@ async function cleanupLocalAssets(localAssets, uploadedAssets = []) {
   const requestIds = new Set();
   const uploadedByName = new Set(
     (Array.isArray(uploadedAssets) ? uploadedAssets : [])
-      .filter((asset) => asset?.uploaded)
+      .filter((asset) => asset?.uploaded || asset?.localStored)
       .map((asset) => String(asset.fileName || "").toLowerCase())
       .filter(Boolean)
   );
-  const anyUploaded = (Array.isArray(uploadedAssets) ? uploadedAssets : []).some((asset) => asset?.uploaded);
+  const anyUploaded = (Array.isArray(uploadedAssets) ? uploadedAssets : []).some((asset) => asset?.uploaded || asset?.localStored);
+  const anyLocalStored = (Array.isArray(uploadedAssets) ? uploadedAssets : []).some((asset) => asset?.localStored);
   for (const asset of Array.isArray(localAssets) ? localAssets : []) {
     if (!anyUploaded) continue;
-    if (uploadedByName.size && asset?.fileName && !uploadedByName.has(String(asset.fileName).toLowerCase())) continue;
+    if (!anyLocalStored && uploadedByName.size && asset?.fileName && !uploadedByName.has(String(asset.fileName).toLowerCase())) continue;
     const match = String(asset.url || "").match(/\/outputs\/([^/]+)/);
     if (match) requestIds.add(decodeURIComponent(match[1]));
   }
